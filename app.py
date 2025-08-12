@@ -12,9 +12,9 @@ st.markdown("""
 2) Only allow mixed loading (even for different PNs and dimensions) for remaining pallet layers ("leftover layers").  
 """)
 
-# -------------------------------
+# ============================================================
 # Upload helpers (template + parsing)
-# -------------------------------
+# ============================================================
 UPLOAD_REQUIRED = [
     "Part No.", "MC Qty", "Length(CM)", "Width(CM)", "Height(CM)",
     "Box/Layer", "Max Layer", "MC Weight (gram)"
@@ -28,7 +28,7 @@ def download_template_bytes() -> bytes:
     return bio.read()
 
 def normalize_uploaded(df: pd.DataFrame) -> pd.DataFrame:
-    """Map uploaded headers to the required template headers; be a bit forgiving with names."""
+    """Map uploaded headers to the required template headers; be forgiving with names."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -50,7 +50,7 @@ def normalize_uploaded(df: pd.DataFrame) -> pd.DataFrame:
             renames[orig] = alias[lc]
     df = df.rename(columns=renames)
 
-    # Ensure all required exist
+    # Ensure required columns exist
     for col in UPLOAD_REQUIRED:
         if col not in df.columns:
             df[col] = pd.NA
@@ -61,6 +61,7 @@ def normalize_uploaded(df: pd.DataFrame) -> pd.DataFrame:
     # Types
     for c in ["MC Qty", "Length(CM)", "Width(CM)", "Height(CM)", "Box/Layer", "Max Layer", "MC Weight (gram)"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df["Part No."] = df["Part No."].astype(str).str.strip()
     df = df.dropna(subset=["Part No."])
     df = df[df["Part No."] != ""].reset_index(drop=True)
@@ -77,9 +78,9 @@ def to_internal_schema(df: pd.DataFrame) -> pd.DataFrame:
     })
     return out
 
-# -------------------------------
+# ============================================================
 # Defaults (used if no upload)
-# -------------------------------
+# ============================================================
 default_data = [
     {"Part No": "51700", "Length (cm)": 60, "Width (cm)": 29, "Height (cm)": 29, "Quantity": 14, "Box/Layer": 6, "Max Layer": 4, "MC Weight (gram)": 0},
     {"Part No": "52363", "Length (cm)": 54, "Width (cm)": 38, "Height (cm)": 31, "Quantity": 5, "Box/Layer": 5, "Max Layer": 4, "MC Weight (gram)": 0},
@@ -93,9 +94,9 @@ default_data = [
     {"Part No": "61403", "Length (cm)": 45, "Width (cm)": 30, "Height (cm)": 25, "Quantity": 24, "Box/Layer": 4, "Max Layer": 4, "MC Weight (gram)": 0},
 ]
 
-# -------------------------------
+# ============================================================
 # Data source: upload or manual
-# -------------------------------
+# ============================================================
 st.header("Data Source")
 
 c1, c2 = st.columns([1,3])
@@ -122,7 +123,7 @@ if uploaded is not None:
             raw_df = pd.read_excel(uploaded)
         raw_df = normalize_uploaded(raw_df)
         in_df = to_internal_schema(raw_df)
-        # Coerce types & take first pn_count for initial display
+        # Coerce numeric types & take first pn_count rows for initial display
         for c in ["Length (cm)", "Width (cm)", "Height (cm)", "Quantity", "Box/Layer", "Max Layer", "MC Weight (gram)"]:
             in_df[c] = pd.to_numeric(in_df[c], errors="coerce")
         in_df = in_df.head(pn_count)
@@ -141,9 +142,9 @@ box_df = st.data_editor(
     key="box_input"
 )
 
-# -------------------------------
+# ============================================================
 # Pallet settings
-# -------------------------------
+# ============================================================
 st.header("Pallet Settings")
 pallet_length = st.number_input("Pallet Length (cm)", min_value=50.0, value=120.0)
 pallet_width  = st.number_input("Pallet Width (cm)",  min_value=50.0, value=100.0)
@@ -151,14 +152,23 @@ pallet_base_height = 15.0
 pallet_max_total_height = st.number_input("Max Pallet Height Including Base (cm)", min_value=100.0, max_value=200.0, value=150.0)
 max_stack_height = pallet_max_total_height - pallet_base_height
 
-# -------------------------------
+# Volumetric divisor (cm³/kg) for volumetric weight calculation
+volumetric_divisor = st.number_input(
+    "Volumetric divisor (cm³/kg)", min_value=3000, max_value=10000, value=6000, step=500
+)
+
+# Pallet tare (actual pallet weight)
+pallet_tare_weight_kg = st.number_input(
+    "Pallet Tare Weight (kg)", min_value=0.0, value=20.0, step=0.5
+)
+
+# ============================================================
 # Core functions (keeps partial-layer overcount)
-# -------------------------------
+# ============================================================
 def explode_layers(df):
     """
     Create one 'layer' record per ceiling(Quantity / Box/Layer).
-    IMPORTANT: This intentionally records Boxes in Layer = Box/Layer even for the last partial layer
-    (overcount), matching your original behavior.
+    IMPORTANT: Boxes in Layer = Box/Layer even for last partial layer (overcount by design).
     """
     layers = []
     for idx, row in df.iterrows():
@@ -167,11 +177,12 @@ def explode_layers(df):
             per_layer_cap = int(row["Box/Layer"])
         except Exception:
             continue
+        if per_layer_cap <= 0:
+            continue
 
-        layers_needed = math.ceil(qty_total / per_layer_cap) if per_layer_cap > 0 else 0
+        layers_needed = math.ceil(qty_total / per_layer_cap)
         for _ in range(layers_needed):
-            # always record full capacity per layer (overcount by design)
-            layer_boxes = per_layer_cap
+            layer_boxes = per_layer_cap  # overcount intentionally
             layers.append({
                 "Part No": str(row["Part No"]),
                 "Box Length": float(row["Length (cm)"]),
@@ -179,7 +190,7 @@ def explode_layers(df):
                 "Box Height": float(row["Height (cm)"]),
                 "Box/Layer": per_layer_cap,
                 "Max Layer": int(row["Max Layer"]),
-                "Boxes in Layer": layer_boxes,   # <- full, even if last is partial
+                "Boxes in Layer": layer_boxes,
                 "Layer Height": float(row["Height (cm)"]),
                 "Layer Source": idx,
                 "MC Weight (gram)": float(row.get("MC Weight (gram)", 0) or 0),
@@ -207,7 +218,6 @@ def pack_layers_by_pn_and_dimension(layers):
         for i in range(num_full_pallets):
             these_layers = group.iloc[i*max_layer:(i+1)*max_layer]
             pallet_height = float(these_layers["Layer Height"].sum())
-            # utilization vs theoretical stack of max_layer * box_height (not vs physical limit)
             util = round((pallet_height / (max_layer * box_height) * 100), 1) if max_layer > 0 and box_height > 0 else 0.0
             pallets.append({
                 "Pallet Group": "Full (No Mix)",
@@ -243,7 +253,6 @@ def pack_leftover_layers_any_mix(unassigned_layers):
         batch_layers = []
         cumulative_height = 0.0
         for idx, row in leftover_layers.iterrows():
-            # respect candidate PN's Max Layer count against current batch size (simple policy)
             if len(batch_layers) >= int(row["Max Layer"]):
                 continue
             if cumulative_height + float(row["Layer Height"]) > max_stack_height:
@@ -271,37 +280,62 @@ def pack_leftover_layers_any_mix(unassigned_layers):
             "Layer Details": batch.to_dict("records"),
             "Layer Summary": dim_str
         })
-        # remove first N rows only (keeps original simple behavior)
         leftover_layers = leftover_layers.iloc[len(batch):]
     return pallets
 
-def create_consolidated_csv(pallets, pallet_L, pallet_W, pallet_base_H):
+def create_consolidated_csv(pallets, pallet_L, pallet_W, pallet_base_H, vol_divisor, pallet_tare_kg):
+    def pn_boxes_from_layers(layer_details):
+        # Sum Boxes in Layer by PN (keeps overcount behavior)
+        counts = {}
+        for r in layer_details:
+            pn = str(r["Part No"])
+            counts[pn] = counts.get(pn, 0) + int(r["Boxes in Layer"])
+        return counts
+
     rows = []
     for i, p in enumerate(pallets):
-        total_height = float(p["Pallet Height (cm)"]) + float(pallet_base_H)
+        total_height = float(p["Pallet Height (cm)"]) + float(pallet_base_H)  # includes base
+
+        # PN → boxes string
+        pn_counts = pn_boxes_from_layers(p.get("Layer Details", []))
+        pn_boxes_str = "; ".join(f"{k}: {v}" for k, v in pn_counts.items()) if pn_counts else ""
+
+        # Volumetric weight (kg) = (L*W*H in cm³) / divisor
+        volume_cm3 = float(pallet_L) * float(pallet_W) * float(total_height)
+        vol_weight_kg = volume_cm3 / float(vol_divisor) if vol_divisor else 0.0
+
+        # Actual cargo weight from layers (overcount-based: Boxes in Layer * MC Weight per box)
+        total_mc_weight_g = 0.0
+        for r in p.get("Layer Details", []):
+            total_mc_weight_g += float(r.get("MC Weight (gram)", 0) or 0) * int(r.get("Boxes in Layer", 0) or 0)
+        total_mc_weight_kg = total_mc_weight_g / 1000.0
+
+        # Add pallet tare weight
+        total_pallet_weight_kg = total_mc_weight_kg + float(pallet_tare_kg)
+
         rows.append({
-            "Pallet No": i+1,
+            "Pallet No": i + 1,
             "Pallet Group": p["Pallet Group"],
             "Part Nos": ", ".join(map(str, p["Part Nos"])),
-            "Box Length (cm)": p["Box Length"],
-            "Box Width (cm)": p["Box Width"],
-            "Box Height (cm)": p["Box Height"],
+            # Removed box L/W/H from export
             "Pallet Length (cm)": float(pallet_L),
             "Pallet Width (cm)": float(pallet_W),
-            "Pallet Height (cm)": round(total_height, 1),  # includes pallet base
-            "Box/Layer": p["Box/Layer"],
-            "Max Layer": p["Max Layer"],
+            "Pallet Height (cm)": round(total_height, 1),  # includes base
+            "Pallet Dimension (cm)": f"{int(pallet_L)}x{int(pallet_W)}x{round(total_height)}",
             "Pallet Layers": p["Pallet Layers"],
-            "Total Boxes": p["Total Boxes"],
+            "Max Layer": p["Max Layer"],
+            "Total Boxes (overcount)": p["Total Boxes"],
+            "PN Boxes": pn_boxes_str,
             "Height Utilization (%)": p["Height Utilization (%)"],
             "Layer Summary": p.get("Layer Summary", ""),
-            "Pallet Dimension (cm)": f"{int(pallet_L)}x{int(pallet_W)}x{round(total_height)}"
+            "Volumetric Weight (kg)": round(vol_weight_kg, 2),
+            "Actual Pallet Weight (kg)": round(total_pallet_weight_kg, 2)  # NEW
         })
     return pd.DataFrame(rows)
 
-# -------------------------------
+# ============================================================
 # Run simulation
-# -------------------------------
+# ============================================================
 if st.button("Simulate and Consolidate"):
     if box_df.empty:
         st.error("Please enter or upload box data")
@@ -310,7 +344,14 @@ if st.button("Simulate and Consolidate"):
         full_pallets, unassigned_layers = pack_layers_by_pn_and_dimension(layers)
         mixed_pallets = pack_leftover_layers_any_mix(unassigned_layers)
         all_pallets = full_pallets + mixed_pallets
-        csv_df = create_consolidated_csv(all_pallets, pallet_length, pallet_width, pallet_base_height)
+        csv_df = create_consolidated_csv(
+            all_pallets,
+            pallet_length,
+            pallet_width,
+            pallet_base_height,
+            volumetric_divisor,
+            pallet_tare_weight_kg
+        )
 
         st.success(f"Total simulated pallets: {len(csv_df)} (including consolidated)")
         st.download_button(
