@@ -27,6 +27,7 @@ def download_template_bytes() -> bytes:
     bio.seek(0)
     return bio.read()
 
+
 def normalize_uploaded(df: pd.DataFrame) -> pd.DataFrame:
     """Map uploaded headers to the required template headers; be forgiving with names."""
     df = df.copy()
@@ -66,6 +67,7 @@ def normalize_uploaded(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["Part No."])
     df = df[df["Part No."] != ""].reset_index(drop=True)
     return df
+
 
 def to_internal_schema(df: pd.DataFrame) -> pd.DataFrame:
     """Convert template columns to internal names used by the logic."""
@@ -148,8 +150,13 @@ box_df = st.data_editor(
 st.header("Pallet Settings")
 pallet_length = st.number_input("Pallet Length (cm)", min_value=50.0, value=120.0)
 pallet_width  = st.number_input("Pallet Width (cm)",  min_value=50.0, value=100.0)
-pallet_base_height = 15.0
-pallet_max_total_height = st.number_input("Max Pallet Height Including Base (cm)", min_value=100.0, max_value=200.0, value=150.0)
+
+# NEW: base height adjustable (default 15 cm)
+pallet_base_height = st.number_input("Pallet Base Height (cm)", min_value=0.0, value=15.0, step=0.5)
+
+# CHANGED: default max total height from 150 -> 155 cm
+pallet_max_total_height = st.number_input("Max Pallet Height Including Base (cm)", min_value=100.0, max_value=200.0, value=155.0)
+
 max_stack_height = pallet_max_total_height - pallet_base_height
 
 # Volumetric divisor (cm³/kg) for volumetric weight calculation
@@ -197,6 +204,7 @@ def explode_layers(df):
             })
     return layers
 
+
 def pack_layers_by_pn_and_dimension(layers):
     pallets = []
     unassigned_layers = []
@@ -243,6 +251,7 @@ def pack_layers_by_pn_and_dimension(layers):
 
     return pallets, unassigned_layers
 
+
 def pack_leftover_layers_any_mix(unassigned_layers):
     pallets = []
     if len(unassigned_layers) == 0:
@@ -265,6 +274,12 @@ def pack_leftover_layers_any_mix(unassigned_layers):
         pallet_height = float(batch["Layer Height"].sum())
         all_pns = sorted(batch["Part No"].unique().tolist())
         dim_str = "; ".join(f'{r["Part No"]}:{r["Box Length"]}x{r["Box Width"]}x{r["Box Height"]}' for _, r in batch.iterrows())
+        util = 0.0
+        if len(batch) > 0:
+            # Util vs theoretical cap from the tightest (min Max Layer * height) within the mix but clamped by max_stack_height
+            theoretical = min(max_stack_height, min(batch["Max Layer"] * batch["Box Height"]))
+            if theoretical > 0:
+                util = round((pallet_height / theoretical) * 100, 1)
         pallets.append({
             "Pallet Group": "Consolidated (Free Mix)",
             "Part Nos": all_pns,
@@ -276,12 +291,13 @@ def pack_leftover_layers_any_mix(unassigned_layers):
             "Pallet Layers": len(batch),
             "Total Boxes": int(batch["Boxes in Layer"].sum()),  # overcount kept
             "Pallet Height (cm)": pallet_height,
-            "Height Utilization (%)": "",
+            "Height Utilization (%)": util,
             "Layer Details": batch.to_dict("records"),
             "Layer Summary": dim_str
         })
         leftover_layers = leftover_layers.iloc[len(batch):]
     return pallets
+
 
 def create_consolidated_csv(pallets, pallet_L, pallet_W, pallet_base_H, vol_divisor, pallet_tare_kg):
     def pn_boxes_from_layers(layer_details):
